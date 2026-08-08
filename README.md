@@ -34,14 +34,3 @@ bash run_npu.sh --dataset Computers --batch-size 128
 ```
 
 `setup.sh` also handles clean shells where `PYTHONPATH` and `LD_LIBRARY_PATH` have not been defined before sourcing CANN's `set_env.sh`.
-
-## Sample data
-
-The repository can be exercised with the official JD micro-behavior samples. Each raw event has the form `item+behavior+category+time_interval+dwell_time`. The preprocessing script creates the three serialized splits, a normalized global transition graph, and dynamic vocabulary metadata expected by `main.py`.
-
-```bash
-python data/prepare_jd.py --dataset Applicances --input data/Applicances/JD_Applicances_sample
-python data/prepare_jd.py --dataset Computers --input data/Computers/JD_Computers_sample
-```
-
-The included samples are intended for pipeline verification. Reproducing paper metrics requires the full JD Micro Behaviors Datasets and the paper's support threshold of 50 (`--min-item-support 50`).
