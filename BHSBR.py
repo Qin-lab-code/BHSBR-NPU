@@ -52,41 +52,40 @@ class HGNN_conv(nn.Module):
         x = G.matmul(x)
         return x
 
-def trans_to_cuda(variable):
-    if torch.cuda.is_available():
-        return variable.cuda()
-    else:
-        return variable
-
-
 class ItemConv(nn.Module):
-    def __init__(self, layers, emb_size=100):
+    def __init__(self, adjacency, layers, emb_size=100):
         super(ItemConv, self).__init__()
         self.emb_size = emb_size
         self.layers = layers
-        self.w_item = {}
-        for i in range(self.layers):
-            self.w_item['weight_item%d' % (i)] = nn.Linear(self.emb_size, self.emb_size, bias=False)
+        self.w_item = nn.ModuleList(
+            nn.Linear(self.emb_size, self.emb_size, bias=False)
+            for _ in range(self.layers)
+        )
 
-    def forward(self, adjacency, embedding):
-        values = adjacency.data
+        # Store the COO graph as buffers so model.to(device) also migrates it.
+        # index_add implements sparse adjacency @ dense embeddings using operators
+        # supported by Ascend, without constructing an NPU sparse tensor.
+        adjacency = adjacency.tocoo()
         indices = np.vstack((adjacency.row, adjacency.col))
-        i = torch.LongTensor(indices)
-        v = torch.FloatTensor(values)
-        shape = adjacency.shape
-        adjacency = torch.sparse.FloatTensor(i, v, torch.Size(shape))
+        self.register_buffer("adj_rows", torch.as_tensor(indices[0], dtype=torch.long))
+        self.register_buffer("adj_cols", torch.as_tensor(indices[1], dtype=torch.long))
+        self.register_buffer("adj_values", torch.as_tensor(adjacency.data, dtype=torch.float32))
+
+    def forward(self, embedding):
         item_embeddings = embedding
         item_embedding_layer0 = item_embeddings
         final = [item_embedding_layer0.unsqueeze(0)]
-        for i in range(self.layers):
-            item_embeddings = trans_to_cuda(self.w_item['weight_item%d' % (i)])(item_embeddings)
-            item_embeddings = torch.sparse.mm(trans_to_cuda(adjacency), item_embeddings)
+        for layer in self.w_item:
+            item_embeddings = layer(item_embeddings)
+            messages = item_embeddings.index_select(0, self.adj_cols)
+            messages = messages * self.adj_values.to(item_embeddings.dtype).unsqueeze(1)
+            item_embeddings = torch.index_add(
+                torch.zeros_like(item_embeddings), 0, self.adj_rows, messages
+            )
             final_embeddings = item_embeddings.unsqueeze(0)
             final.append(F.normalize(final_embeddings, dim=-1, p=2))
         final = torch.cat(final, dim=0)
-        # item_embeddings = np.sum(final, 0)/(self.layers+1)
         item_embeddings = torch.mean(final, dim=0)
-        item_embeddings = torch.cuda.FloatTensor(item_embeddings)
         return item_embeddings
 
 class HierarchicalGNN(nn.Module):
@@ -159,9 +158,8 @@ class BHSBR(nn.Module):
 
         self.n_actions = n_actions
 
-        self.adj = adj
         self.layers = 2
-        self.ItemGraph = ItemConv(self.layers)
+        self.ItemGraph = ItemConv(adj, self.layers, x_dim)
 
         self.hgnn_layer = HGNN(self.x_dim)
         self.glu1 = nn.Linear(hidden_dim, hidden_dim)
@@ -210,7 +208,7 @@ class BHSBR(nn.Module):
 
     def forward(self, items, A, alias_inputs, item_seq_len, macro_items,
                 micro_actions, micro_len, actions, action_pairs, pos):
-        item_embeddings = self.ItemGraph(self.adj, self.item_embeddings.weight)
+        item_embeddings = self.ItemGraph(self.item_embeddings.weight)
         seq_len = alias_inputs.size(1) + 1
         actions = actions[:, :seq_len]
         pos = pos[:, :seq_len]
@@ -230,7 +228,7 @@ class BHSBR(nn.Module):
         star_node = torch.sum(hidden, 1) / length  # B,d
         # star_0 = star_node
         for i in range(self.step):
-            hidden, star_node = self.update_item_layer(hidden, star_node.squeeze(), A, macro_items_embedding,
+            hidden, star_node = self.update_item_layer(hidden, star_node.squeeze(1) if star_node.dim() == 3 else star_node, A, macro_items_embedding,
                                                        micro_actions_embedding, micro_len)  # batch, hidden_size
         h_f = self.highway_network(hidden, h_0)
 
@@ -266,15 +264,13 @@ class BHSBR(nn.Module):
         hgnn_emb = torch.stack(emb_list, dim=0)
 
         seq_out = torch.stack((ht, hgnn_emb), dim=0)
-        weights = (torch.matmul(seq_out, self.attn_weights.unsqueeze(0).unsqueeze(0)) * self.attn).sum(-1)
-        # 2, b, l, 1
+        weights = (torch.matmul(seq_out, self.attn_weights) * self.attn).sum(-1)
         score = F.softmax(weights, dim=0).unsqueeze(-1)
         seq_out = (seq_out * score).sum(0)
 
         # seq_out = ht
 
-        c = seq_out.squeeze()
-        c = torch.mean(c, dim=0)
+        c = seq_out
         l_c = (c / torch.norm(c, dim=-1).unsqueeze(1))  # \hat{m}
         l_emb = self.item_embeddings.weight[1:] / torch.norm(self.item_embeddings.weight[1:], dim=-1).unsqueeze(1)
         # l_emb = self.item_embeddings.weight[1:] / torch.norm(self.item_embeddings.weight[1:], dim=-1).unsqueeze(1) # v_i
@@ -311,37 +307,24 @@ class BHSBR(nn.Module):
         Gs = []
         n_objs = torch.count_nonzero(seqs, dim=1).tolist()
         for batch_idx in range(seqs.shape[0]):
-            seq = seqs[batch_idx]
             n_obj = n_objs[batch_idx]
-            seq = seq[:n_obj].cpu()
-            seq_list = seq.tolist()
+            seq_actions = actions[batch_idx, :n_obj].long()
+            valid_actions = seq_actions.gt(0)
+            action_indices = (seq_actions - 1).clamp_min(0)
+            action_counts = F.one_hot(action_indices, num_classes=self.n_actions)
+            H = (
+                action_counts.to(dtype=self.item_embeddings.weight.dtype)
+                * valid_actions.unsqueeze(-1)
+            ).sum(dim=1)
+            H = H + 0.0001
 
-            seq_actions = actions[batch_idx]
-
-            n_edge = self.n_actions
-            # hyper graph: n_obj, n_edge
-            H = torch.full((n_obj, n_edge), 0.0001, device=seq.device)
-
-            for i, item in enumerate(seq_list):
-                item_action = seq_actions[i]
-                j = 0
-                while j < len(item_action) and item_action[j] != 0:
-                    k = item_action[j]-1
-                    H[i, k] += 1.0
-                    j += 1
-                # multi-behavior hyperedge
-            # print(H.detach().cpu().tolist())
-            # W = torch.ones(n_edge, device=H.device)
-            # W = torch.diag(W)
             DV = torch.sum(H, dim=1)
             DE = torch.sum(H, dim=0)
             invDE = torch.diag(torch.pow(DE, -1))
             invDV = torch.diag(torch.pow(DV, -1))
-            # DV2 = torch.diag(torch.pow(DV, -0.5))
             HT = H.t()
             G = invDV.mm(H).mm(invDE).mm(HT)
-            # G = DV2.mm(H).mm(invDE).mm(HT).mm(DV2)
             assert not torch.isnan(G).any()
-            Gs.append(G.to(seqs.device))
+            Gs.append(G)
         Gs_block_diag = torch.block_diag(*Gs)
         return Gs_block_diag

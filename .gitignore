@@ -194,6 +194,14 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Downloaded and generated recommendation datasets
+data/*/JD_*_sample
+data/*/*_sets_EMBSR.pt
+data/*/adj.pickle
+data/*/item_map.json
+data/*/metadata.json
+results/
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data

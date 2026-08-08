@@ -10,6 +10,7 @@ import torch.nn.init as init
 import pickle
 from torch.nn.utils.rnn import pad_sequence
 from BHSBR import BHSBR
+from device import resolve_device
 import datetime
 # from Model.PairRNN import PairSelfAttentionLayer
 import argparse
@@ -20,6 +21,11 @@ import logging
 import time
 import sys
 import os
+import json
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # Logging setup: log to file + console
 def setup_logger(log_file_path):
@@ -51,6 +57,17 @@ class ListDataset(Dataset):
 
     def __len__(self):
         return len(self.datalist[0])
+
+
+def load_legacy_dataset(path):
+    """Load the trusted bundled legacy dataset on old and new PyTorch releases."""
+    main_module = sys.modules.get('__main__')
+    if main_module is not None and not hasattr(main_module, 'ListDataset'):
+        setattr(main_module, 'ListDataset', ListDataset)
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
 
 
 def batch_padding(batch):
@@ -95,10 +112,11 @@ def batch_padding(batch):
         macro_items), torch.LongTensor(new_micro_actions), torch.LongTensor(micro_len), action, torch.Tensor(
         new_pairs), poses, torch.LongTensor(y)
 
-def preprocess_data(data_name):
-    train_sets = torch.load('./data/%s/train_sets_EMBSR.pt' % data_name)
-    valid_sets = torch.load('./data/%s/valid_sets_EMBSR.pt' % data_name)
-    test_sets = torch.load('./data/%s/test_sets_EMBSR.pt' % data_name)
+def preprocess_data(data_name, batch_size=128):
+    dataset_dir = BASE_DIR / 'data' / data_name
+    train_sets = load_legacy_dataset(dataset_dir / 'train_sets_EMBSR.pt')
+    valid_sets = load_legacy_dataset(dataset_dir / 'valid_sets_EMBSR.pt')
+    test_sets = load_legacy_dataset(dataset_dir / 'test_sets_EMBSR.pt')
     # if data_name == 'Trivago' or data_name == 'sample':
     #     train_sets = torch.load('../data/%s/train_sets_EMBSR.pt'% data_name)
     #     valid_sets = torch.load('../data/%s/valid_sets_EMBSR.pt'% data_name)
@@ -108,14 +126,18 @@ def preprocess_data(data_name):
     #     valid_sets = torch.load('../data/%s/valid_sets_EMBSR.pt'% data_name)
     #     test_sets = torch.load('../data/%s/test_sets_EMBSR.pt'% data_name)
         #train_sets, valid_sets, test_sets = train_dataload.dataset, valid_dataload.dataset, test_dataload.dataset
-    adj_file = open('./data/%s/adj.pickle' % data_name, 'rb')
-    adj = pickle.load(adj_file)
-    adj_file.close()
-    train_dataload = DataLoader(train_sets, batch_size=128, shuffle=True,collate_fn=batch_padding, num_workers=0)
-    valid_dataload = DataLoader(valid_sets, batch_size=128, shuffle=False,collate_fn=batch_padding, num_workers=0)
-    test_dataload = DataLoader(test_sets, batch_size=128, shuffle=False,collate_fn=batch_padding, num_workers=0)
-    # data_name = 'Computers'
-    if data_name == 'Applicances':
+    with (dataset_dir / 'adj.pickle').open('rb') as adj_file:
+        adj = pickle.load(adj_file)
+    train_dataload = DataLoader(train_sets, batch_size=batch_size, shuffle=True,collate_fn=batch_padding, num_workers=0)
+    valid_dataload = DataLoader(valid_sets, batch_size=batch_size, shuffle=False,collate_fn=batch_padding, num_workers=0)
+    test_dataload = DataLoader(test_sets, batch_size=batch_size, shuffle=False,collate_fn=batch_padding, num_workers=0)
+    metadata_path = dataset_dir / 'metadata.json'
+    if metadata_path.exists():
+        with metadata_path.open('r', encoding='utf-8') as metadata_file:
+            metadata = json.load(metadata_file)
+        item_vocab_size = metadata['item_vocab_size']
+        max_position = metadata['max_position']
+    elif data_name == 'Applicances':
         item_vocab_size = 77259
         max_position = 20
     elif data_name == 'Computers':
@@ -130,40 +152,50 @@ def preprocess_data(data_name):
     return train_dataload, valid_dataload, test_dataload, item_vocab_size, max_position, adj
 
 
-def train_process(train_data, model,criterion, opti, epoch):
+def train_process(train_data, model, criterion, opti, epoch, device):
     losses = 0
     steps = len(train_data)
-    # criterion = nn.CrossEntropyLoss().cuda()
     for step, (x_items, x_alias, x_A, x_len, x_macro, x_micro, x_micro_len, x_action, x_pairs, x_poses, y_train) in enumerate(train_data):
         # new_index = [ i for i in range(1, x_poses.size(1))] + [0]
         # x_action, x_poses, x_pairs = x_action[:,new_index], x_poses[:, new_index], x_pairs[:, new_index, new_index]
         opti.zero_grad()
-        q = model(x_items.cuda(), x_A.float().cuda(), x_alias.cuda(), x_len.cuda(), x_macro.cuda(), x_micro.cuda(), x_micro_len.cuda(),x_action.long().cuda(),x_pairs.long().cuda(), x_poses.long().cuda())
+        q = model(
+            x_items.to(device), x_A.float().to(device), x_alias.to(device),
+            x_len.to(device), x_macro.to(device), x_micro.to(device),
+            x_micro_len.to(device), x_action.long().to(device),
+            x_pairs.long().to(device), x_poses.long().to(device)
+        )
         target_items = y_train
-        # loss = model.CosSimilarityLoss(q, target_items.cuda())
-        loss = criterion(q, target_items.cuda()-1)
+        loss = criterion(q, target_items.to(device)-1)
         loss.backward()
         opti.step()
         losses += loss.item()
         if (step + 1) % 100 == 0:
             logging.info("[Epoch %02d/%d] Step %03d/%d - Mean Loss: %.4f", epoch, 30, step, steps, losses / (step + 1))
 
-def valid_process(valid_data, model, valid_test):
-    y_pre_item_all = torch.LongTensor().cuda()
-    y_pre_item_all_5 = torch.LongTensor().cuda()
-    y_pre_item_all_10 = torch.LongTensor().cuda()
-    valid_target_item = torch.LongTensor().cuda()
+def valid_process(valid_data, model, valid_test, device):
+    y_pre_item_all = torch.empty((0, 20), dtype=torch.long, device=device)
+    y_pre_item_all_5 = torch.empty((0, 5), dtype=torch.long, device=device)
+    y_pre_item_all_10 = torch.empty((0, 10), dtype=torch.long, device=device)
+    valid_target_item = torch.empty(0, dtype=torch.long, device=device)
     for x_test_items, x_test_alias, x_test_A, x_test_len, x_test_macro, x_test_micro, x_test_micro_len, x_action_test, x_pairs_test, x_poses_test, y_test in valid_data:
         with torch.no_grad():
             # if valid_test == 'test':
             #     x_action_test, x_pairs_test, x_poses_test = x_action_test[:,:-1], x_pairs_test[:, :-1, :-1], x_poses_test[:, :-1]
-            pre_items_5  = model(x_test_items.cuda(), x_test_A.float().cuda(), x_test_alias.cuda(), x_test_len.cuda(), x_test_macro.cuda(), x_test_micro.cuda(), x_test_micro_len.cuda(), x_action_test.long().cuda(), x_pairs_test.long().cuda(), x_poses_test.long().cuda()).topk(5, dim=1)[1]
-            pre_items_10  = model(x_test_items.cuda(), x_test_A.float().cuda(), x_test_alias.cuda(), x_test_len.cuda(), x_test_macro.cuda(), x_test_micro.cuda(), x_test_micro_len.cuda(), x_action_test.long().cuda(), x_pairs_test.long().cuda(), x_poses_test.long().cuda()).topk(10, dim=1)[1]
-            pre_items  = model(x_test_items.cuda(), x_test_A.float().cuda(), x_test_alias.cuda(), x_test_len.cuda(), x_test_macro.cuda(), x_test_micro.cuda(), x_test_micro_len.cuda(), x_action_test.long().cuda(), x_pairs_test.long().cuda(), x_poses_test.long().cuda()).topk(20, dim=1)[1]
+            scores = model(
+                x_test_items.to(device), x_test_A.float().to(device),
+                x_test_alias.to(device), x_test_len.to(device),
+                x_test_macro.to(device), x_test_micro.to(device),
+                x_test_micro_len.to(device), x_action_test.long().to(device),
+                x_pairs_test.long().to(device), x_poses_test.long().to(device)
+            )
+            pre_items = scores.topk(20, dim=1)[1]
+            pre_items_5 = pre_items[:, :5]
+            pre_items_10 = pre_items[:, :10]
             y_pre_item_all_5 = torch.cat((y_pre_item_all_5, pre_items_5), 0)
             y_pre_item_all_10 = torch.cat((y_pre_item_all_10, pre_items_10), 0)
             y_pre_item_all = torch.cat((y_pre_item_all, pre_items), 0)
-        valid_target_item = torch.cat((valid_target_item, y_test.cuda()))
+        valid_target_item = torch.cat((valid_target_item, y_test.to(device)))
     items_recall_5 = get_recall(y_pre_item_all_5, valid_target_item.unsqueeze(1)-1)
     items_mrr_5 = get_mrr(y_pre_item_all_5, valid_target_item.unsqueeze(1)-1)
     items_ndcg_5 = get_ndcg(y_pre_item_all_5.cpu(), valid_target_item.unsqueeze(1).cpu()-1)
@@ -189,18 +221,17 @@ def valid_process(valid_data, model, valid_test):
 
 
 
-def get_model(model_name, item_vocab_size, max_position, config, drop_, alpha_, adj):
+def get_model(model_name, item_vocab_size, max_position, config, drop_, alpha_, adj, device):
     item_embedding_size, behavior_embedding_size, hidden_size = config[0], config[1], config[2]
     if model_name == 'EMBSR':
         model = BHSBR(item_vocab_size + 1, adj, 11, max_position+1, 101, item_embedding_size, behavior_embedding_size, 100, hidden_size , drop_, alpha_, step=4)
     elif model_name == 'EMBSR_trivago':
         model = BHSBR(item_vocab_size + 1, adj, 7, max_position+1, 50, item_embedding_size, behavior_embedding_size, 100, hidden_size , drop_, alpha_)
-    return model.cuda()
+    return model.to(device)
 
 
 # def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_name, config, result_file_name, lr_, drop_, alpha, adj):
 #     model = get_model(model_name, item_vocab_size, max_position, config, drop_, alpha, adj)
-#     criterion = nn.CrossEntropyLoss().cuda()
 #     opti = optim.Adam(model.parameters(), lr=lr_, weight_decay=0, amsgrad=True)
 
 #     best_hr, best_mrr = 0, 0
@@ -289,9 +320,9 @@ def get_model(model_name, item_vocab_size, max_position, config, drop_, alpha_, 
 #     logging.info("Best Test HR@20: %.4f, MRR@20: %.4f", best_test_hr, best_test_mrr)
 #     logging.info("Full best test result list: %s", str(best_test_list))
 
-def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_name, config, result_file_name, lr_, drop_, alpha, adj):
-    model = get_model(model_name, item_vocab_size, max_position, config, drop_, alpha, adj)
-    criterion = nn.CrossEntropyLoss().cuda()
+def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_name, config, result_file_name, lr_, drop_, alpha, adj, device, epochs=50, patience=10):
+    model = get_model(model_name, item_vocab_size, max_position, config, drop_, alpha, adj, device)
+    criterion = nn.CrossEntropyLoss().to(device)
     opti = optim.Adam(model.parameters(), lr=lr_, weight_decay=0, amsgrad=True)
 
     best_hr, best_mrr = 0, 0
@@ -310,8 +341,8 @@ def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_
     setup_logger(log_path)
     logging.info("Training started. Model: %s", model_name)
 
-    for epoch in range(50):
-        if stop_number > 10:
+    for epoch in range(epochs):
+        if stop_number > patience:
             break
 
         epoch_start = time.time()
@@ -320,15 +351,15 @@ def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_
         # 训练阶段
         train_start = time.time()
         model.train()
-        train_process(train_data, model, criterion, opti, epoch)
+        train_process(train_data, model, criterion, opti, epoch, device)
         train_end = time.time()
 
         # 推理阶段（验证 + 测试）
         inference_start = time.time()
         model.eval()
         with torch.no_grad():
-            valid_hr, valid_mrr, valid_results = valid_process(valid_data, model, 'valid')
-            test_hr, test_mrr, test_results = valid_process(test_data, model, 'test')
+            valid_hr, valid_mrr, valid_results = valid_process(valid_data, model, 'valid', device)
+            test_hr, test_mrr, test_results = valid_process(test_data, model, 'test', device)
 
             metrics['hr5'] = test_results[0]
             metrics['hr10'] = test_results[3]
@@ -396,18 +427,25 @@ def run(train_data, valid_data, test_data, item_vocab_size, max_position, model_
 
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.cuda.set_device(3)
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train BHSBR on Ascend NPU, CUDA, or CPU')
+    parser.add_argument('--device', choices=['auto', 'npu', 'cuda', 'cpu'], default='auto')
+    parser.add_argument('--device-id', type=int, default=0)
+    parser.add_argument('--dataset', choices=['Applicances', 'Computers', 'Trivago', 'sample'], default='Applicances')
+    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--patience', type=int, default=10)
+    return parser.parse_args()
 
-parameters = [100, 100, 100]
 
-# file_names = ['Applicances', 'Computers', 'Trivago', 'sample']
-file_names = ['Applicances']
-model_names = ['EMBSR']
-
-for file_name in file_names:
+def main():
+    args = parse_args()
+    device = resolve_device(args.device, args.device_id)
+    logging.info('Using device: %s', device)
+    parameters = [100, 100, 100]
+    file_name = args.dataset
     model_name = 'EMBSR'
-    process_train, process_valid, process_test, item_vocab_size, max_position, adj = preprocess_data(file_name)
+    process_train, process_valid, process_test, item_vocab_size, max_position, adj = preprocess_data(file_name, args.batch_size)
     alpha = 12
     if file_name =='Applicances':
         lr_ = 0.0001
@@ -421,10 +459,20 @@ for file_name in file_names:
         model_name = 'EMBSR_trivago'
     np.random.seed(1)
     torch.manual_seed(1)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(1)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    elif device.type == 'npu':
+        torch.npu.manual_seed_all(1)
     nowtime = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-    result_file = 'result_%s_%s_%s' % (model_name, file_name, nowtime)
+    results_dir = BASE_DIR / 'results'
+    results_dir.mkdir(exist_ok=True)
+    result_file = str(results_dir / ('result_%s_%s_%s' % (model_name, file_name, nowtime)))
     # process_train, process_valid, process_test, item_vocab_size, max_position = preprocess_data(file_name)
-    run(process_train, process_valid, process_test, item_vocab_size, max_position, model_name, parameters, result_file, lr_, drop_, alpha, adj)
+    run(process_train, process_valid, process_test, item_vocab_size, max_position, model_name, parameters, result_file, lr_, drop_, alpha, adj, device, args.epochs, args.patience)
     # process_train, process_valid, process_test = 0, 0, 0
+
+
+if __name__ == '__main__':
+    main()

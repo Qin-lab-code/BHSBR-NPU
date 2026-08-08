@@ -1,0 +1,8 @@
+numpy
+scipy
+scikit-learn
+PyYAML
+importlib-metadata; python_version < "3.10"
+
+# Install torch and torch_npu as a mutually compatible pair for the host CANN
+# release. They are intentionally not pinned here because Ascend images differ.
