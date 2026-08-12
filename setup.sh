@@ -3,6 +3,7 @@ set -eo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CANN_ENV="/usr/local/Ascend/ascend-toolkit/set_env.sh"
+MS_VERSION="${MS_VERSION:-2.9.0}"
 
 if [[ ! -f "${CANN_ENV}" ]]; then
   echo "ERROR: CANN environment script not found: ${CANN_ENV}" >&2
@@ -14,39 +15,24 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 set +u
 source "${CANN_ENV}"
 
-echo "Installing Python runtime dependencies..."
-python -m pip install -r "${PROJECT_DIR}/requirements.txt"
+python -m pip install "mindspore==${MS_VERSION}" \
+  -i https://repo.mindspore.cn/pypi/simple \
+  --trusted-host repo.mindspore.cn \
+  --extra-index-url https://repo.huaweicloud.com/repository/pypi/simple/
+python -m pip install numpy scipy
 
-echo "Checking CANN libraries and Python packages..."
 python - <<'PY'
 import ctypes
-import sys
+import mindspore as ms
 
-for library in ("libhccl.so", "libascendcl.so"):
-    try:
-        ctypes.CDLL(library)
-    except OSError as exc:
-        raise SystemExit(f"ERROR: unable to load {library}: {exc}")
+for library in ("libascendcl.so", "libhccl.so"):
+    ctypes.CDLL(library)
 
-try:
-    import yaml
-    import importlib_metadata
-    import torch
-    import torch_npu
-except Exception as exc:
-    raise SystemExit(f"ERROR: Python environment check failed: {exc}") from exc
-
-print("Python:", sys.version.split()[0])
-print("PyYAML:", yaml.__version__)
-print("importlib-metadata:", importlib_metadata.version("importlib-metadata"))
-print("torch:", torch.__version__)
-print("torch_npu:", torch_npu.__version__)
-print("NPU available:", torch.npu.is_available())
-print("NPU count:", torch.npu.device_count())
-
-if not torch.npu.is_available():
-    raise SystemExit("ERROR: torch_npu imported, but no usable NPU was detected")
+ms.set_context(device_target="Ascend", device_id=0)
+print("MindSpore:", ms.__version__)
+print("Device target:", ms.get_context("device_target"))
+ms.run_check()
 PY
 
-echo
-echo "Setup completed successfully."
+echo "Setup completed. Example:"
+echo "  bash run_mindspore.sh --dataset Computers --batch-size 128"

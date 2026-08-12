@@ -200,6 +200,7 @@ data/*/*_sets_EMBSR.pt
 data/*/adj.pickle
 data/*/item_map.json
 data/*/metadata.json
+data/*/*_sets_mindspore.pkl
 results/
 
 # Cursor

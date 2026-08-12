@@ -12,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
-import torch
 
 
 DATASET_NAMES = ("Applicances", "Computers")
@@ -76,7 +75,7 @@ def build_example(session, action_count=10):
 
     nodes = np.unique(input_items)
     node_lookup = {int(item): index for index, item in enumerate(nodes)}
-    alias_inputs = torch.tensor([node_lookup[item] for item in input_items], dtype=torch.long)
+    alias_inputs = np.asarray([node_lookup[item] for item in input_items], dtype=np.int32)
 
     boundaries = [
         index for index in range(len(input_items) - 1)
@@ -90,13 +89,13 @@ def build_example(session, action_count=10):
     for edge_index in range(edge_count - 1):
         adjacency_out[node_lookup[macro_items[edge_index]], edge_index] = 1
         adjacency_in[node_lookup[macro_items[edge_index + 1]], edge_index] = 1
-    adjacency = torch.from_numpy(np.concatenate((adjacency_in, adjacency_out), axis=0))
+    adjacency = np.concatenate((adjacency_in, adjacency_out), axis=0).astype(np.float32)
 
     micro_actions = []
     micro_lengths = []
     start = 0
     for boundary in boundaries:
-        actions = torch.tensor(input_actions[start:boundary + 1], dtype=torch.long)
+        actions = np.asarray(input_actions[start:boundary + 1], dtype=np.int32)
         micro_actions.append(actions)
         micro_lengths.append(len(actions))
         start = boundary + 1
@@ -111,16 +110,16 @@ def build_example(session, action_count=10):
             pairs[row, col] = (left - 1) * action_count + right
 
     return (
-        torch.tensor(nodes, dtype=torch.long),
+        np.asarray(nodes, dtype=np.int32),
         alias_inputs,
         adjacency,
         len(alias_inputs),
-        torch.tensor(macro_items, dtype=torch.long),
+        np.asarray(macro_items, dtype=np.int32),
         micro_actions,
-        torch.tensor(micro_lengths, dtype=torch.long),
-        torch.tensor(actions, dtype=torch.long),
-        torch.from_numpy(pairs),
-        torch.tensor(positions, dtype=torch.long),
+        np.asarray(micro_lengths, dtype=np.int32),
+        np.asarray(actions, dtype=np.int32),
+        pairs.astype(np.int32),
+        np.asarray(positions, dtype=np.int32),
         target_item,
     )
 
@@ -161,10 +160,12 @@ def main():
     output_dir = args.output_root / args.dataset
     output_dir.mkdir(parents=True, exist_ok=True)
     for split_name, split in (("train", train), ("valid", valid), ("test", test)):
-        torch.save(
-            [build_example(session) for session in split],
-            output_dir / f"{split_name}_sets_EMBSR.pt",
-        )
+        with (output_dir / f"{split_name}_sets_mindspore.pkl").open("wb") as destination:
+            pickle.dump(
+                [build_example(session) for session in split],
+                destination,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
 
     adjacency = build_global_adjacency(train, len(item_map))
     with (output_dir / "adj.pickle").open("wb") as destination:
