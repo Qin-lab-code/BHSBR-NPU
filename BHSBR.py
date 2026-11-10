@@ -1,330 +1,215 @@
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-import torch
-import torch.nn as nn
+"""MindSpore implementation of BHSBR for Ascend training."""
+
 import math
-import torch.nn.functional as F
-import numpy as np
+
+import mindspore as ms
+from mindspore import Tensor, nn, ops
+from mindspore.common.initializer import Normal
 
 
-class HGNN(nn.Module):
-    def __init__(self, n_hid, dropout=0.2):
-        super(HGNN, self).__init__()
-        self.dropout = dropout
-        self.hgc1 = HGNN_conv(n_hid, n_hid)
-        self.hgc2 = HGNN_conv(n_hid, n_hid)
-        self.out_fc = nn.Linear(n_hid, n_hid)
-
-    def forward(self, x, G):
-        x1 = self.hgc1(x, G)
-        # x1 = F.relu(x1)
-        x1 = F.dropout(x1, self.dropout, training=self.training)
-        x2 = self.hgc2(x1, G)
-        # x2 = F.relu(x2)
-        x2 = F.dropout(x2, self.dropout, training=self.training)
-        return ((x1+x2)/2)
-        return self.out_fc((x1+x2)/2)
-
-
-class HGNN_conv(nn.Module):
-    def __init__(self, n_hid, bias=True):
-        super(HGNN_conv, self).__init__()
-
-        self.weight = nn.Parameter(torch.Tensor(n_hid, n_hid))
-        nn.init.normal_(self.weight, std=0.02)
-
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(n_hid))
-            nn.init.normal_(self.bias, std=0.02)
-        else:
-            self.register_parameter('bias', None)
-        # self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
-        if self.bias is not None:
-            self.bias.data.uniform_(-stdv, stdv)
-
-    def forward(self, x: torch.Tensor, G: torch.Tensor):
-        x = x.matmul(self.weight)
-        if self.bias is not None:
-            x = x + self.bias
-        x = G.matmul(x)
-        return x
-
-class ItemConv(nn.Module):
-    def __init__(self, adjacency, layers, emb_size=100):
-        super(ItemConv, self).__init__()
-        self.emb_size = emb_size
-        self.layers = layers
-        self.w_item = nn.ModuleList(
-            nn.Linear(self.emb_size, self.emb_size, bias=False)
-            for _ in range(self.layers)
+class HGNNConv(nn.Cell):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.weight = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.02), (hidden_size, hidden_size), ms.float32)
+        )
+        self.bias = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.02), (hidden_size,), ms.float32)
         )
 
-        # Store the COO graph as buffers so model.to(device) also migrates it.
-        # index_add implements sparse adjacency @ dense embeddings using operators
-        # supported by Ascend, without constructing an NPU sparse tensor.
+    def construct(self, x, graph):
+        return ops.matmul(graph, ops.matmul(x, self.weight) + self.bias)
+
+
+class HGNN(nn.Cell):
+    def __init__(self, hidden_size, dropout=0.2):
+        super().__init__()
+        self.conv1 = HGNNConv(hidden_size)
+        self.conv2 = HGNNConv(hidden_size)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def construct(self, x, graph):
+        first = self.dropout(self.conv1(x, graph))
+        second = self.dropout(self.conv2(first, graph))
+        return (first + second) / 2.0
+
+
+class ItemConv(nn.Cell):
+    """Global item propagation without constructing an Ascend sparse tensor."""
+
+    def __init__(self, adjacency, layers=2, embedding_size=100):
+        super().__init__()
         adjacency = adjacency.tocoo()
-        indices = np.vstack((adjacency.row, adjacency.col))
-        self.register_buffer("adj_rows", torch.as_tensor(indices[0], dtype=torch.long))
-        self.register_buffer("adj_cols", torch.as_tensor(indices[1], dtype=torch.long))
-        self.register_buffer("adj_values", torch.as_tensor(adjacency.data, dtype=torch.float32))
+        self.rows = Tensor(adjacency.row.astype("int32"), ms.int32)
+        self.cols = Tensor(adjacency.col.astype("int32"), ms.int32)
+        self.values = Tensor(adjacency.data.astype("float32"), ms.float32)
+        self.layers = nn.CellList(
+            [nn.Dense(embedding_size, embedding_size, has_bias=False) for _ in range(layers)]
+        )
+        self.normalize = ops.L2Normalize(axis=-1, epsilon=1e-12)
 
-    def forward(self, embedding):
-        item_embeddings = embedding
-        item_embedding_layer0 = item_embeddings
-        final = [item_embedding_layer0.unsqueeze(0)]
-        for layer in self.w_item:
-            item_embeddings = layer(item_embeddings)
-            messages = item_embeddings.index_select(0, self.adj_cols)
-            messages = messages * self.adj_values.to(item_embeddings.dtype).unsqueeze(1)
-            item_embeddings = torch.index_add(
-                torch.zeros_like(item_embeddings), 0, self.adj_rows, messages
-            )
-            final_embeddings = item_embeddings.unsqueeze(0)
-            final.append(F.normalize(final_embeddings, dim=-1, p=2))
-        final = torch.cat(final, dim=0)
-        item_embeddings = torch.mean(final, dim=0)
-        return item_embeddings
+    def construct(self, embeddings):
+        propagated = embeddings
+        outputs = [ops.expand_dims(embeddings, 0)]
+        scatter_indices = ops.expand_dims(self.rows, 1)
+        for layer in self.layers:
+            propagated = layer(propagated)
+            messages = ops.gather(propagated, self.cols, 0)
+            messages = messages * ops.expand_dims(self.values, 1)
+            propagated = ops.tensor_scatter_add(ops.zeros_like(propagated), scatter_indices, messages)
+            outputs.append(ops.expand_dims(self.normalize(propagated), 0))
+        return ops.mean(ops.concat(outputs, axis=0), axis=0)
 
-class HierarchicalGNN(nn.Module):
-    r"""Graph neural networks are well-suited for session-based recommendation,
-    because it can automatically extract features of session graphs with considerations of rich node connections.
-    """
 
+class HierarchicalGNN(nn.Cell):
     def __init__(self, embedding_size, step=1):
-        super(HierarchicalGNN, self).__init__()
-        self.gru = nn.GRU(embedding_size, embedding_size, batch_first=True)
+        super().__init__()
         self.step = step
         self.embedding_size = embedding_size
-        self.input_size = embedding_size * 2
-        self.gate_size = embedding_size * 3
-        self.w_ih = nn.Parameter(torch.Tensor(self.gate_size, self.input_size))
-        self.w_hh = nn.Parameter(torch.Tensor(self.gate_size, self.embedding_size))
-        self.b_ih = nn.Parameter(torch.Tensor(self.gate_size))
-        self.b_hh = nn.Parameter(torch.Tensor(self.gate_size))
-        self.b_iah = nn.Parameter(torch.Tensor(self.embedding_size))
-        self.b_ioh = nn.Parameter(torch.Tensor(self.embedding_size))
+        self.gru = nn.GRU(embedding_size, embedding_size, batch_first=True)
+        self.w_ih = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.1), (embedding_size * 3, embedding_size * 2), ms.float32)
+        )
+        self.w_hh = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.1), (embedding_size * 3, embedding_size), ms.float32)
+        )
+        self.b_ih = ms.Parameter(ms.common.initializer.initializer(Normal(0.1), (embedding_size * 3,), ms.float32))
+        self.b_hh = ms.Parameter(ms.common.initializer.initializer(Normal(0.1), (embedding_size * 3,), ms.float32))
+        self.b_in = ms.Parameter(ms.common.initializer.initializer(Normal(0.1), (embedding_size,), ms.float32))
+        self.b_out = ms.Parameter(ms.common.initializer.initializer(Normal(0.1), (embedding_size,), ms.float32))
+        self.edge_in = nn.Dense(embedding_size * 2, embedding_size)
+        self.edge_out = nn.Dense(embedding_size * 2, embedding_size)
 
-        self.linear_edge_in = nn.Linear(2 * self.embedding_size, self.embedding_size, bias=True)
-        self.linear_edge_out = nn.Linear(2 * self.embedding_size, self.embedding_size, bias=True)
+    def cell(self, adjacency, hidden, macro, micro, micro_len):
+        batch, edges, actions, dim = micro.shape
+        flat = micro.reshape((batch * edges, actions, dim))
+        gru_output, _ = self.gru(flat)
+        last_index = ops.maximum(micro_len.reshape((-1,)).astype(ms.int32) - 1, 0)
+        gather_index = last_index.reshape((-1, 1, 1))
+        gather_index = ops.tile(gather_index, (1, 1, dim))
+        micro_hidden = ops.gather_d(gru_output, 1, gather_index).squeeze(1)
+        micro_hidden = micro_hidden.reshape((batch, edges, dim))
 
-    def GNNCell(self, A, hidden, macro_items, micro_actions, action_len):
+        macro_hidden = ops.concat((macro, micro_hidden), axis=2)
+        incoming = self.edge_in(macro_hidden)
+        outgoing = self.edge_out(macro_hidden)
+        inputs = ops.concat(
+            (
+                ops.matmul(adjacency[:, :, :edges], incoming) + self.b_in,
+                ops.matmul(adjacency[:, :, edges:], outgoing) + self.b_out,
+            ),
+            axis=2,
+        )
+        gi = ops.matmul(inputs, self.w_ih.T) + self.b_ih
+        gh = ops.matmul(hidden, self.w_hh.T) + self.b_hh
+        i_r, i_i, i_n = ops.split(gi, split_size_or_sections=self.embedding_size, axis=2)
+        h_r, h_i, h_n = ops.split(gh, split_size_or_sections=self.embedding_size, axis=2)
+        reset = ops.sigmoid(i_r + h_r)
+        update = ops.sigmoid(i_i + h_i)
+        candidate = ops.tanh(i_n + reset * h_n)
+        return (1.0 - update) * hidden + update * candidate
 
-        batch_size, n_edges, n_actions = micro_actions.size(0), micro_actions.size(1), micro_actions.size(2)
-        action_len_ = action_len.view(batch_size * n_edges)
-        packed = pack_padded_sequence(micro_actions.view(batch_size * n_edges, n_actions, self.embedding_size),
-                                      action_len_.tolist(), batch_first=True, enforce_sorted=False)
-        _, micro_actions_h = self.gru(packed)  # 1, B*n_edges, dim
-        micro_actions_h = micro_actions_h.view(batch_size, n_edges, self.embedding_size)  # B, n_edges, dim
-        # macro_hidden = macro_items + micro_actions_h
-        macro_hidden = torch.cat([macro_items, micro_actions_h], 2)
-        _in = self.linear_edge_in(macro_hidden)
-        _out = self.linear_edge_out(macro_hidden)
-        input_in = torch.matmul(A[:, :, :n_edges], _in) + self.b_iah
-        input_out = torch.matmul(A[:, :, n_edges:], _out) + self.b_ioh
-
-        inputs = torch.cat([input_in, input_out], 2)  #
-
-        gi = F.linear(inputs, self.w_ih, self.b_ih)
-        gh = F.linear(hidden, self.w_hh, self.b_hh)
-
-        i_r, i_i, i_n = gi.chunk(3, 2)  # 在二维上拆分成3份
-        h_r, h_i, h_n = gh.chunk(3, 2)
-        resetgate = torch.sigmoid(i_r + h_r)
-        inputgate = torch.sigmoid(i_i + h_i)
-        newgate = torch.tanh(i_n + resetgate * h_n)
-        hy = (1 - inputgate) * hidden + inputgate * newgate
-        return hy
-
-    def forward(self, A, hidden, macro_items, micro_actions, micro_len):
-        for i in range(self.step):
-            hidden = self.GNNCell(A, hidden, macro_items, micro_actions, micro_len)
+    def construct(self, adjacency, hidden, macro, micro, micro_len):
+        for _ in range(self.step):
+            hidden = self.cell(adjacency, hidden, macro, micro, micro_len)
         return hidden
 
 
-class BHSBR(nn.Module):
-    def __init__(self, n_items, adj, n_actions, n_pos, n_action_pairs, x_dim, a_dim, pos_dim, hidden_dim,
-                 dropout_rate=0, alpha=12, step=1):
-        super(BHSBR, self).__init__()
-        self.item_embeddings = nn.Embedding(n_items, x_dim, padding_idx=0)
-        self.action_embeddings = nn.Embedding(n_actions, a_dim, padding_idx=0)
-        self.pos_embeddings = nn.Embedding(n_pos, pos_dim, padding_idx=0)
-        self.action_pairs_embeddings = nn.Embedding(n_action_pairs, a_dim, padding_idx=0)
-        self.x_dim = x_dim
-        self.hidden_size = hidden_dim
-        self.embedding_size = hidden_dim
-
+class BHSBR(nn.Cell):
+    def __init__(
+        self, n_items, adjacency, n_actions, n_positions, n_action_pairs,
+        item_dim=100, action_dim=100, position_dim=100, hidden_dim=100,
+        dropout_rate=0.0, alpha=12.0, step=1,
+    ):
+        super().__init__()
+        self.item_embeddings = nn.Embedding(n_items, item_dim, padding_idx=0)
+        self.action_embeddings = nn.Embedding(n_actions, action_dim, padding_idx=0)
+        self.position_embeddings = nn.Embedding(n_positions, position_dim, padding_idx=0)
+        self.action_pair_embeddings = nn.Embedding(n_action_pairs, action_dim, padding_idx=0)
         self.n_actions = n_actions
-
-        self.layers = 2
-        self.ItemGraph = ItemConv(adj, self.layers, x_dim)
-
-        self.hgnn_layer = HGNN(self.x_dim)
-        self.glu1 = nn.Linear(hidden_dim, hidden_dim)
-        self.glu2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.w_s = nn.Parameter(torch.Tensor(hidden_dim, 1))
-        self.attn_weights = nn.Parameter(torch.Tensor(self.hidden_size, self.hidden_size))
-        self.attn = nn.Parameter(torch.Tensor(1, self.hidden_size))
-
-        self.dropout = nn.Dropout(dropout_rate)
-        # self.input_size = x_dim + pos_dim + a_dim
-
-        self.gnn = HierarchicalGNN(hidden_dim)
-
-
-        # self.gru_relation = nn.GRU(self.hidden_size, self.hidden_size, num_layers=1, batch_first=True)
-
-        self.W_q_one = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        self.W_k_one = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        self.W_q_two = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        self.W_k_two = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        self.W_g = nn.Linear(2 * self.embedding_size, self.embedding_size, bias=True)
-        self.linear_one = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        self.linear_two = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        #self.linear_three = nn.Linear(self.embedding_size, self.embedding_size, bias=True)
-        #self.linear_zero = nn.Linear(self.embedding_size, 1, bias=False)
-        #self.linear_transform = nn.Linear(self.embedding_size * 2, self.embedding_size, bias=True)
-        # parameters initialization
-        self.step = step  #
-        self._reset_parameters()
+        self.hidden_dim = hidden_dim
+        self.step = step
         self.alpha = alpha
 
-    def _reset_parameters(self):
-        for weight in self.parameters():
-            weight.data.normal_(0, 0.1)
+        self.item_graph = ItemConv(adjacency, layers=2, embedding_size=item_dim)
+        self.hgnn = HGNN(item_dim)
+        self.gnn = HierarchicalGNN(hidden_dim)
+        self.w_q1 = nn.Dense(hidden_dim, hidden_dim)
+        self.w_k1 = nn.Dense(hidden_dim, hidden_dim)
+        self.w_q2 = nn.Dense(hidden_dim, hidden_dim)
+        self.w_k2 = nn.Dense(hidden_dim, hidden_dim)
+        self.highway = nn.Dense(hidden_dim * 2, hidden_dim)
+        self.attn_weights = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.1), (hidden_dim, hidden_dim), ms.float32)
+        )
+        self.attn = ms.Parameter(
+            ms.common.initializer.initializer(Normal(0.1), (1, hidden_dim), ms.float32)
+        )
+        self.normalize = ops.L2Normalize(axis=-1, epsilon=1e-12)
 
-    def generate_session(self, sessions, hidden):
-        sess_len = torch.count_nonzero(sessions, dim=1).tolist()
-        session_emb = torch.div(torch.sum(hidden, 1), sess_len)
-        len = session_emb[1]
-        hs = session_emb.unsqueeze(-2).repeat(1, len, 1)
-        nh = torch.sigmoid(self.glu1(hidden) + self.glu2(hs))
-        # beta = torch.matmul(nh, self.w_s)
-        sess_emb = torch.sum(nh, 1)
-        return sess_emb
+    def update_items(self, hidden, star, adjacency, macro, micro, micro_len):
+        hidden = self.gnn(adjacency, hidden, macro, micro, micro_len)
+        alpha = ops.bmm(self.w_q1(hidden), ops.expand_dims(self.w_k1(star), 2))
+        alpha = alpha / math.sqrt(self.hidden_dim)
+        new_hidden = (1.0 - alpha) * hidden + alpha * ops.expand_dims(star, 1)
+        beta = ops.bmm(self.w_k2(new_hidden), ops.expand_dims(self.w_q2(star), 2))
+        beta = ops.softmax(beta / math.sqrt(self.hidden_dim), axis=1)
+        new_star = ops.bmm(ops.transpose(beta, (0, 2, 1)), new_hidden)
+        return new_hidden, new_star
 
+    def build_hypergraph(self, actions):
+        valid = actions > 0
+        indices = ops.maximum(actions.astype(ms.int32) - 1, 0)
+        counts = ops.one_hot(indices, self.n_actions, Tensor(1.0, ms.float32), Tensor(0.0, ms.float32))
+        incidence = ops.sum(counts * ops.expand_dims(valid.astype(ms.float32), -1), dim=1) + 0.0001
+        dv = ops.sum(incidence, dim=1)
+        de = ops.sum(incidence, dim=0)
+        return ops.diag(1.0 / dv) @ incidence @ ops.diag(1.0 / de) @ incidence.T
 
-    def forward(self, items, A, alias_inputs, item_seq_len, macro_items,
-                micro_actions, micro_len, actions, action_pairs, pos):
-        item_embeddings = self.ItemGraph(self.item_embeddings.weight)
-        seq_len = alias_inputs.size(1) + 1
-        actions = actions[:, :seq_len]
-        pos = pos[:, :seq_len]
-        action_pairs = action_pairs[:, :seq_len, :seq_len]
-        # hidden, action_pairs_embedding = item_embeddings[items], self.action_pairs_embeddings(action_pairs)
-        hidden, action_pairs_embedding = self.item_embeddings(items), self.action_pairs_embeddings(action_pairs)
-        actions_embedding = self.action_embeddings(actions)
-        pos_embedding = self.pos_embeddings(pos)
-        # macro_items_embedding = item_embeddings[macro_items]  # B, n_edges, dim
-        macro_items_embedding = self.item_embeddings(macro_items)  # B, n_edges, dim
-        micro_actions_embedding = self.action_embeddings(micro_actions)  # B, n_edges, n_micro_a, dim
-        mask = alias_inputs.gt(-1)
-        h_0 = hidden
-        hidden_mask = items.gt(0)
-        length = torch.sum(hidden_mask, 1).unsqueeze(1)
+    def construct(self, items, adjacency, alias, seq_len, macro_items, micro_actions, micro_len, actions, pairs, positions):
+        global_items = self.item_graph(self.item_embeddings.embedding_table)
+        sequence_size = alias.shape[1] + 1
+        actions = actions[:, :sequence_size]
+        positions = positions[:, :sequence_size]
+        pairs = pairs[:, :sequence_size, :sequence_size]
 
-        star_node = torch.sum(hidden, 1) / length  # B,d
-        # star_0 = star_node
-        for i in range(self.step):
-            hidden, star_node = self.update_item_layer(hidden, star_node.squeeze(1) if star_node.dim() == 3 else star_node, A, macro_items_embedding,
-                                                       micro_actions_embedding, micro_len)  # batch, hidden_size
-        h_f = self.highway_network(hidden, h_0)
+        hidden = self.item_embeddings(items)
+        initial = hidden
+        macro_embedding = self.item_embeddings(macro_items)
+        micro_embedding = self.action_embeddings(micro_actions)
+        length = ops.sum((items > 0).astype(ms.float32), dim=1, keepdim=True)
+        star = ops.sum(hidden, dim=1) / ops.maximum(length, 1.0)
 
-        # action_output, action_hidden = self.gru_relation(actions_embedding, None)
-        alias_inputs = alias_inputs.masked_fill(mask == False, 0)
-        alias_inputs = alias_inputs.view(-1, alias_inputs.size(1), 1).expand(-1, -1, self.hidden_size)
-        new_mask = actions.gt(0)
-        seq_hidden = torch.gather(h_f, dim=1, index=alias_inputs)
-        seq_hidden = torch.cat([star_node, seq_hidden], dim=1)
-        # self_input = seq_hidden + pos_embedding + actions_embedding
-        self_input = seq_hidden + actions_embedding
-        # item_seq_len 是没有special 的序列长度
-        ht = self.gather_indexes(self_input, item_seq_len)
+        for _ in range(self.step):
+            hidden, star = self.update_items(hidden, star, adjacency, macro_embedding, micro_embedding, micro_len)
+            if star.ndim == 3:
+                star = star.squeeze(1)
+        gate = ops.sigmoid(self.highway(ops.concat((initial, hidden), axis=2)))
+        hidden = gate * initial + (1.0 - gate) * hidden
 
-        Gs = self.build_Gs_unique(macro_items, micro_actions)
-        batch_size = macro_items.shape[0]
-        n_objs = torch.count_nonzero(macro_items, dim=1).tolist()
-        indexed_emb = list()
-        for batch_idx in range(batch_size):
-            n_obj = n_objs[batch_idx]
-            indexed_emb.append(item_embeddings[macro_items[batch_idx][:n_obj]])
-        indexed_emb = torch.cat(indexed_emb, dim=0)
-        hgnn_emb =self.hgnn_layer(indexed_emb, Gs)
-        emb_list = []
-        start = 0
-        for batch_idx in range(batch_size):
-            n_obj = n_objs[batch_idx]
-            embs = hgnn_emb[start:start+n_obj]
-            start += n_obj
+        safe_alias = ops.maximum(alias.astype(ms.int32), 0)
+        gather_index = ops.expand_dims(safe_alias, 2)
+        gather_index = ops.tile(gather_index, (1, 1, self.hidden_dim))
+        sequence_hidden = ops.gather_d(hidden, 1, gather_index)
+        sequence_hidden = ops.concat((ops.expand_dims(star, 1), sequence_hidden), axis=1)
+        sequence_input = sequence_hidden + self.action_embeddings(actions)
+        last_index = seq_len.astype(ms.int32).reshape((-1, 1, 1))
+        last_index = ops.tile(last_index, (1, 1, self.hidden_dim))
+        last_hidden = ops.gather_d(sequence_input, 1, last_index).squeeze(1)
 
-            embs = torch.mean(embs, dim=0)
-            emb_list.append(embs)
-        hgnn_emb = torch.stack(emb_list, dim=0)
+        hgnn_outputs = []
+        for batch_index in range(macro_items.shape[0]):
+            count = int(ops.sum((macro_items[batch_index] > 0).astype(ms.int32)).asnumpy())
+            count = max(count, 1)
+            selected = ops.gather(global_items, macro_items[batch_index, :count].astype(ms.int32), 0)
+            graph = self.build_hypergraph(micro_actions[batch_index, :count])
+            hgnn_outputs.append(ops.mean(self.hgnn(selected, graph), axis=0))
+        hgnn_hidden = ops.stack(hgnn_outputs, axis=0)
 
-        seq_out = torch.stack((ht, hgnn_emb), dim=0)
-        weights = (torch.matmul(seq_out, self.attn_weights) * self.attn).sum(-1)
-        score = F.softmax(weights, dim=0).unsqueeze(-1)
-        seq_out = (seq_out * score).sum(0)
-
-        # seq_out = ht
-
-        c = seq_out
-        l_c = (c / torch.norm(c, dim=-1).unsqueeze(1))  # \hat{m}
-        l_emb = self.item_embeddings.weight[1:] / torch.norm(self.item_embeddings.weight[1:], dim=-1).unsqueeze(1)
-        # l_emb = self.item_embeddings.weight[1:] / torch.norm(self.item_embeddings.weight[1:], dim=-1).unsqueeze(1) # v_i
-        y = self.alpha * torch.matmul(l_c, l_emb.t())
-        return y
-
-    def update_item_layer(self, h_last, star_node_last, A, macro_items_e, micro_actions_e, micro_len):
-        hidden = self.gnn(A, h_last, macro_items_e, micro_actions_e, micro_len)
-        q_one = self.W_q_one(hidden)  # B, L, d
-        k_one = self.W_k_one(star_node_last)  # B, d
-        alpha_i = torch.bmm(q_one, k_one.unsqueeze(2)) / math.sqrt(self.embedding_size)  # B, L, 1
-        new_h = (1 - alpha_i) * hidden + alpha_i * star_node_last.unsqueeze(1)  # B, L, d
-
-        q_two = self.W_q_two(star_node_last)
-        k_two = self.W_k_two(new_h)
-        beta = torch.softmax(torch.bmm(k_two, q_two.unsqueeze(2)) / math.sqrt(self.embedding_size), 1)  # B, L, 1
-        new_star_node = torch.bmm(beta.transpose(1, 2), new_h)  # B, 1, d
-
-        return new_h, new_star_node
-        #return hidden, star_node_last
-
-    def highway_network(self, hidden, h_0):
-        g = torch.sigmoid(self.W_g(torch.cat((h_0, hidden), 2)))  # B,L,d
-        h_f = g * h_0 + (1 - g) * hidden
-        return h_f
-
-    def gather_indexes(self, output, gather_index):
-        """Gathers the vectors at the spexific positions over a minibatch"""
-        gather_index = gather_index.view(-1, 1, 1).expand(-1, -1, output.shape[-1])
-        output_tensor = output.gather(dim=1, index=gather_index)
-        return output_tensor.squeeze(1)
-
-    def build_Gs_unique(self, seqs, actions):
-        Gs = []
-        n_objs = torch.count_nonzero(seqs, dim=1).tolist()
-        for batch_idx in range(seqs.shape[0]):
-            n_obj = n_objs[batch_idx]
-            seq_actions = actions[batch_idx, :n_obj].long()
-            valid_actions = seq_actions.gt(0)
-            action_indices = (seq_actions - 1).clamp_min(0)
-            action_counts = F.one_hot(action_indices, num_classes=self.n_actions)
-            H = (
-                action_counts.to(dtype=self.item_embeddings.weight.dtype)
-                * valid_actions.unsqueeze(-1)
-            ).sum(dim=1)
-            H = H + 0.0001
-
-            DV = torch.sum(H, dim=1)
-            DE = torch.sum(H, dim=0)
-            invDE = torch.diag(torch.pow(DE, -1))
-            invDV = torch.diag(torch.pow(DV, -1))
-            HT = H.t()
-            G = invDV.mm(H).mm(invDE).mm(HT)
-            assert not torch.isnan(G).any()
-            Gs.append(G)
-        Gs_block_diag = torch.block_diag(*Gs)
-        return Gs_block_diag
+        combined = ops.stack((last_hidden, hgnn_hidden), axis=0)
+        weights = ops.sum(ops.matmul(combined, self.attn_weights) * self.attn, dim=-1)
+        weights = ops.expand_dims(ops.softmax(weights, axis=0), -1)
+        session = ops.sum(combined * weights, dim=0)
+        session = self.normalize(session)
+        candidates = self.normalize(self.item_embeddings.embedding_table[1:])
+        return self.alpha * ops.matmul(session, candidates.T)

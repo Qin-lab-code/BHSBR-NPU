@@ -1,5 +1,6 @@
-# BHSBR
-This is our implementation for paper "Behavior Habits Enhanced Intention Learning for Session-Based Recommendation"
+# BHSBR - MindSpore Ascend Migration
+
+MindSpore implementation of "Behavior Habits Enhanced Intention Learning for Session-Based Recommendation".
 
 ## Contributions
 
@@ -11,26 +12,67 @@ This is our implementation for paper "Behavior Habits Enhanced Intention Learnin
 
 This research was financially supported by the Open Research Fund from Guangdong Laboratory of Artificial Intelligence and Digital Economy (SZ), under Grant No. GML-KF-24-22.
 
-## Ascend NPU migration
+## Framework
 
-The training code supports Ascend NPU through `torch_npu`, while retaining CUDA and CPU fallbacks. In automatic mode the runtime preference is NPU, CUDA, then CPU.
+The training path is implemented with native MindSpore APIs:
 
-```bash
-# Ascend NPU (recommended on an Ascend host)
-python main.py --device npu --device-id 0 --dataset Applicances
+- `mindspore.nn.Cell` model components
+- `mindspore.value_and_grad` automatic differentiation
+- MindSpore Adam and CrossEntropyLoss
+- Ascend device context
+- NumPy/SciPy runtime dataset files
 
-# Automatic fallback or CPU smoke run
-python main.py --device auto --dataset Applicances
-python main.py --device cpu --dataset sample
-```
+PyTorch and `torch_npu` are not imported by model training. PyTorch is only an optional one-time dependency for converting trusted historical `.pt` datasets.
 
-Install a `torch_npu` build compatible with the host PyTorch and CANN versions before selecting `--device npu`.
+## Ascend setup
 
-On an Ascend host, install the common Python dependencies and validate CANN/HCCL/NPU availability first:
+The default setup targets MindSpore 2.9.0 and CANN 8.3.RC1 or newer compatible CANN releases.
 
 ```bash
 bash setup.sh
-bash run_npu.sh --dataset Computers --batch-size 128
 ```
 
-`setup.sh` also handles clean shells where `PYTHONPATH` and `LD_LIBRARY_PATH` have not been defined before sourcing CANN's `set_env.sh`.
+Run training:
+
+```bash
+bash run_mindspore.sh --dataset Computers --batch-size 128
+bash run_mindspore.sh --dataset Trivago --batch-size 128
+```
+
+For a short smoke run:
+
+```bash
+bash run_mindspore.sh --dataset Computers --batch-size 4 --epochs 1
+```
+
+## Dataset format
+
+MindSpore training reads the following files from each dataset directory:
+
+```text
+adj.pickle
+train_sets_mindspore.pkl
+valid_sets_mindspore.pkl
+test_sets_mindspore.pkl
+metadata.json (optional)
+```
+
+Convert a trusted legacy PyTorch dataset once:
+
+```bash
+python data/convert_pt_to_mindspore.py --dataset-dir data/Computers
+python data/convert_pt_to_mindspore.py --dataset-dir data/Trivago
+```
+
+After conversion, training no longer needs PyTorch.
+
+The included JD preprocessing script now writes the MindSpore runtime format directly:
+
+```bash
+python data/prepare_jd.py --dataset Applicances --input data/Applicances/JD_Applicances_sample
+python data/prepare_jd.py --dataset Computers --input data/Computers/JD_Computers_sample
+```
+
+## Evaluation
+
+The program reports Recall/HR, MRR and NDCG at 5, 10 and 20. A single epoch is selected by validation HR@20 + MRR@20, and the corresponding test metrics are retained. Results and the best MindSpore checkpoint are written to `results/`.
