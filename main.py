@@ -162,10 +162,10 @@ def train_epoch(iterator, model, loss_fn, optimizer, epoch):
     total = 0.0
     for step, batch in enumerate(iterator, 1):
         loss, gradients = grad_fn(*batch)
-        optimizer(gradients)
         value = float(loss.asnumpy())
         if not np.isfinite(value):
             raise FloatingPointError(f"non-finite loss at epoch {epoch}, step {step}: {value}")
+        optimizer(gradients)
         total += value
         if step % 100 == 0:
             logging.info("Epoch %d step %d/%d mean_loss %.4f", epoch, step, len(iterator), total / step)
